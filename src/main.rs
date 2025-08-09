@@ -41,17 +41,25 @@ struct Renderer {
     mem: Arc<Mutex<Mem>>,
     args: Args,
     threads: usize,
+    chunksize: usize,
     start_time: Instant,
     recorded: bool,
 }
 
 impl Renderer {
-    fn new(stopping: Arc<AtomicBool>, mem: Arc<Mutex<Mem>>, args: Args, threads: usize) -> Self {
+    fn new(
+        stopping: Arc<AtomicBool>,
+        mem: Arc<Mutex<Mem>>,
+        args: Args,
+        threads: usize,
+        chunksize: usize,
+    ) -> Self {
         Self {
             stopping,
             mem,
             args,
             threads,
+            chunksize,
             start_time: Instant::now(),
             recorded: false,
         }
@@ -92,9 +100,12 @@ impl EventHandler for Renderer {
                     max: Option<usize>,
                     steps_per_sec: f32,
                 }
-                let Args {
-                    steps, chunksize, ..
-                } = self.args;
+                let Self {
+                    threads,
+                    chunksize,
+                    args: Args { steps, .. },
+                    ..
+                } = *self;
                 let Mem {
                     total,
                     highest,
@@ -103,7 +114,6 @@ impl EventHandler for Renderer {
                     ..
                 } = *self.mem.lock().unwrap();
                 let steps_per_sec = self.steps_per_sec(total);
-                let threads = self.threads;
                 writer
                     .serialize(Record {
                         steps,
@@ -224,7 +234,7 @@ struct Args {
     width: usize,
     #[arg(short, long)]
     threads: Option<usize>,
-    #[arg(short, long, default_value_t = 1_000)]
+    #[arg(short, long, default_value_t = 2usize.pow(23))]
     chunksize: usize,
     #[arg(short, long)]
     runtime: Option<f32>,
@@ -248,6 +258,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(usize::from)
         .unwrap_or(1);
     let threads = threads.min(args.threads.unwrap_or(threads));
+    let chunksize = args.chunksize / args.steps;
 
     thread::scope(|scope| {
         (0..threads).for_each(|_| {
@@ -257,7 +268,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let one = Simd::from([1; SIMD_CHUNKWIDTH]);
                 let two = Simd::from([2; SIMD_CHUNKWIDTH]);
                 while !stopping.load(Relaxed) {
-                    for _ in 0..args.chunksize {
+                    for _ in 0..chunksize {
                         let mut sim_block = Simd::from([0i16; SIMD_CHUNKWIDTH]);
                         for _ in 0..args.steps {
                             let bits: [i16; SIMD_CHUNKWIDTH] = rng.random();
@@ -291,7 +302,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         local_mem_chunk.fill(0);
                     }
                     mem.highest = highest;
-                    mem.total += args.chunksize * SIMD_CHUNKWIDTH;
+                    mem.total += chunksize * SIMD_CHUNKWIDTH;
                     let mut min = mem.min;
                     let mut max = mem.max;
                     for i in mem
@@ -330,6 +341,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Arc::clone(&mem),
             args.clone(),
             threads,
+            chunksize,
         );
 
         event::run(ctx, events, renderer);
