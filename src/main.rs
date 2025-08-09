@@ -2,6 +2,8 @@
 #![feature(array_chunks)]
 use std::{
     error::Error,
+    fs::OpenOptions,
+    path::PathBuf,
     simd::{
         Simd,
         num::{SimdInt, SimdUint},
@@ -16,8 +18,9 @@ use std::{
 };
 
 use clap::{Parser, crate_authors, crate_name};
+use csv::WriterBuilder;
 use ggez::{
-    ContextBuilder,
+    ContextBuilder, GameError,
     conf::{WindowMode, WindowSetup},
     event,
     graphics::{DrawParam, Mesh, Text},
@@ -27,32 +30,97 @@ use ggez::{
     graphics::{Canvas, Color},
 };
 use rand::{Rng, rng};
+use serde::Serialize;
 
-const CHUNKSIZE: usize = 10_000;
 const SIMD_CHUNKWIDTH: usize = 32;
-const MEM_SIMD_CHUNKWIDTH: usize = 4;
+const MEM_SIMD_CHUNKWIDTH: usize = 8;
 
 #[derive()]
 struct Renderer {
     stopping: Arc<AtomicBool>,
     mem: Arc<Mutex<Mem>>,
     args: Args,
+    threads: usize,
     start_time: Instant,
+    recorded: bool,
 }
 
 impl Renderer {
-    fn new(stopping: Arc<AtomicBool>, mem: Arc<Mutex<Mem>>, args: Args) -> Self {
+    fn new(stopping: Arc<AtomicBool>, mem: Arc<Mutex<Mem>>, args: Args, threads: usize) -> Self {
         Self {
             stopping,
             mem,
             args,
+            threads,
             start_time: Instant::now(),
+            recorded: false,
+        }
+    }
+
+    fn steps_per_sec(&self, total: usize) -> f32 {
+        if self.start_time.elapsed().as_secs_f32() > 0.0 {
+            (self.args.steps * total) as f32 / self.start_time.elapsed().as_secs_f32()
+        } else {
+            0.0
         }
     }
 }
 
 impl EventHandler for Renderer {
-    fn update(&mut self, _ctx: &mut ggez::Context) -> Result<(), ggez::GameError> {
+    fn update(&mut self, ctx: &mut ggez::Context) -> Result<(), ggez::GameError> {
+        if let Some(runtime) = self.args.runtime {
+            if !self.recorded && self.start_time.elapsed().as_secs_f32() >= runtime {
+                self.recorded = true;
+                let exists = self.args.outfile.exists();
+                let writer = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&self.args.outfile)
+                    .map_err(|e| GameError::FilesystemError(e.to_string()))?;
+                let mut writer = WriterBuilder::new()
+                    .has_headers(!exists)
+                    .from_writer(writer);
+                #[derive(Serialize)]
+                struct Record {
+                    steps: usize,
+                    threads: usize,
+                    chunksize: usize,
+                    runtime: f32,
+                    total: usize,
+                    highest: usize,
+                    min: Option<usize>,
+                    max: Option<usize>,
+                    steps_per_sec: f32,
+                }
+                let Args {
+                    steps, chunksize, ..
+                } = self.args;
+                let Mem {
+                    total,
+                    highest,
+                    min,
+                    max,
+                    ..
+                } = *self.mem.lock().unwrap();
+                let steps_per_sec = self.steps_per_sec(total);
+                let threads = self.threads;
+                writer
+                    .serialize(Record {
+                        steps,
+                        threads,
+                        chunksize,
+                        runtime,
+                        total,
+                        highest,
+                        min,
+                        max,
+                        steps_per_sec,
+                    })
+                    .map_err(|e| GameError::FilesystemError(e.to_string()))?;
+                ctx.request_quit();
+            }
+        }
+
         Ok(())
     }
 
@@ -76,8 +144,7 @@ impl EventHandler for Renderer {
         }
 
         // corner stats
-        let steps_per_sec =
-            (self.args.steps as f64 * mem.total as f64) / self.start_time.elapsed().as_secs_f64();
+        let steps_per_sec = self.steps_per_sec(mem.total);
         let format_option = |x: Option<usize>| x.map(|v| format!("{v}")).unwrap_or("N/A".into());
         let format_num = |n| match n {
             _ if n > 1e12 => format!("{:.3}T", n / 1e12),
@@ -86,7 +153,7 @@ impl EventHandler for Renderer {
             _ if n > 1e3 => format!("{:.3}K", n / 1e3),
             _ => format!("{:.3}", n),
         };
-        let stats_text = format!(
+        let mut stats_text = format!(
             "Total: {}
 Height: {}
 Min: {}
@@ -98,6 +165,10 @@ Steps/sec: {}",
             format_option(mem.max),
             format_num(steps_per_sec)
         );
+        if let Some(runtime) = self.args.runtime {
+            let runtime_left = (runtime - self.start_time.elapsed().as_secs_f32()).max(0.0);
+            stats_text.push_str(&format!("\nTest time remaining: {runtime_left:.1}s"));
+        }
         let stats_text = Text::new(stats_text);
         let margin: f32 = 10.0;
         let stats_bounds = stats_text.measure(ctx)?;
@@ -153,6 +224,12 @@ struct Args {
     width: usize,
     #[arg(short, long)]
     threads: Option<usize>,
+    #[arg(short, long, default_value_t = 1_000)]
+    chunksize: usize,
+    #[arg(short, long)]
+    runtime: Option<f32>,
+    #[arg(short, long, default_value = "results.csv")]
+    outfile: PathBuf,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -180,7 +257,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let one = Simd::from([1; SIMD_CHUNKWIDTH]);
                 let two = Simd::from([2; SIMD_CHUNKWIDTH]);
                 while !stopping.load(Relaxed) {
-                    for _ in 0..CHUNKSIZE {
+                    for _ in 0..args.chunksize {
                         let mut sim_block = Simd::from([0i16; SIMD_CHUNKWIDTH]);
                         for _ in 0..args.steps {
                             let bits: [i16; SIMD_CHUNKWIDTH] = rng.random();
@@ -214,7 +291,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         local_mem_chunk.fill(0);
                     }
                     mem.highest = highest;
-                    mem.total += CHUNKSIZE * SIMD_CHUNKWIDTH;
+                    mem.total += args.chunksize * SIMD_CHUNKWIDTH;
                     let mut min = mem.min;
                     let mut max = mem.max;
                     for i in mem
@@ -248,7 +325,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         ctx.gfx.set_window_title("normalbench");
 
-        let renderer = Renderer::new(Arc::clone(&stopping), Arc::clone(&mem), args.clone());
+        let renderer = Renderer::new(
+            Arc::clone(&stopping),
+            Arc::clone(&mem),
+            args.clone(),
+            threads,
+        );
 
         event::run(ctx, events, renderer);
     });
